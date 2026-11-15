@@ -4,10 +4,12 @@ Provides detailed input fields for manual bridge parameter definition
 """
 from copy import deepcopy
 
+import re
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTabBar, QLabel, QLineEdit,
     QComboBox, QPushButton, QCheckBox, QSizePolicy,
-    QDialog, QSizePolicy, QSizeGrip,
+    QDialog, QSizePolicy, QSizeGrip, QStackedWidget, QAbstractButton, QTableWidget,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QEvent
 from PySide6.QtGui import QDoubleValidator
@@ -22,6 +24,50 @@ from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builde
 from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import ADDITIONAL_INPUTS_SCHEMA
 from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder._load_combination_widget import LoadCombinationWidget
 from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builder import AdaptiveWidget
+
+MSG_EMPTY_CUSTOM_FIELD = "Error: The custom value for '{}' cannot be empty."
+MSG_UNSAVED_CHANGES = (
+    "You have unsaved changes. Closing this window will discard them. "
+    "Do you want to proceed?"
+)
+BTN_DISCARD = "Discard"
+BTN_CANCEL = "Cancel"
+
+
+def _clean_label(label: str) -> str:
+    """Schema labels may carry HTML (e.g. C<sub>D</sub>) and a trailing colon."""
+    text = re.sub(r"<[^>]+>", "", str(label or ""))
+    return text.strip().rstrip(":").strip()
+
+
+def _iter_schema_sections(node, tab_label: str = ""):
+    """Yield (tab_label, fields) for every block of rows in a tab schema.
+
+    A block is any dict holding a "rows" list; its fields are all the field
+    definitions of those rows. Fields in one block belong to the same card, so a
+    "Custom" dropdown there governs the text boxes next to it.
+    """
+    if isinstance(node, dict):
+        if "type" not in node:
+            # Top-level tabs and tab schemas use "label"; sub-tabs use "title" beside "schema"
+            if "label" in node:
+                tab_label = _clean_label(node["label"]) or tab_label
+            elif "schema" in node and "title" in node:
+                tab_label = _clean_label(node["title"]) or tab_label
+        rows = node.get("rows")
+        if isinstance(rows, list):
+            fields = [
+                f for row in rows if isinstance(row, dict)
+                for f in row.get("fields", []) if isinstance(f, dict)
+            ]
+            yield tab_label, fields
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                yield from _iter_schema_sections(value, tab_label)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_schema_sections(item, tab_label)
+
 
 # =================================================================================
 #   MAIN IMPLEMENTATION
@@ -57,6 +103,10 @@ class AdditionalInputs(QDialog):
  
         # Store all Compute functions to be called at Design
         self._compute_functions = []
+
+        # Unsaved-changes tracking: set by user edits, cleared on Save / Discard / reopen
+        self.is_modified = False
+        self._saved_snapshot = {}
 
         self.setObjectName("AdditionalInputs")
         self.setMinimumSize(900, 520)
@@ -504,9 +554,169 @@ class AdditionalInputs(QDialog):
             if hasattr(tab_widget, "refresh_active_tab"):
                 tab_widget.refresh_active_tab()
 
+        # Every open starts from the committed state: anything set up so far was
+        # done by the program, not the user.
+        self._wire_modification_tracking()
+        self._mark_clean()
+
+    def closeEvent(self, event):  # Qt event: warns before discarding unsaved changes (title-bar close)
+        if not self._confirm_discard_changes():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def reject(self):  # Qt slot: Esc key path, routed through the same unsaved-changes check
+        if not self._confirm_discard_changes():
+            return
+        super().reject()
+
+    # ── Unsaved Changes Tracking ─────────────────────────────────────────────────
+
+    def _wire_modification_tracking(self):  # setup: connects user-only edit signals of every input to set is_modified
+        """Uses signals Qt emits only for user interaction (textEdited, activated,
+        clicked), so values the dialog fills in programmatically never count as
+        changes. Safe to call repeatedly; each widget is wired once."""
+        for w in self.content_widget.findChildren(QWidget):
+            if w.property("_modification_tracked") or w is self.save_button:
+                continue
+            if isinstance(w, QLineEdit):
+                w.textEdited.connect(self._set_modified)
+            elif isinstance(w, QComboBox):
+                w.activated.connect(self._set_modified)
+            elif isinstance(w, QAbstractButton):
+                if w.isCheckable():
+                    w.clicked.connect(self._set_modified)
+                else:
+                    # Buttons open sub-dialogs (bounds, vehicles) or reset defaults;
+                    # count them only if they actually changed the inputs.
+                    w.clicked.connect(self._check_inputs_changed)
+            elif isinstance(w, QTableWidget):
+                w.itemDelegate().commitData.connect(self._set_modified)
+            else:
+                continue
+            w.setProperty("_modification_tracked", True)
+
+    def _set_modified(self, *_):
+        self.is_modified = True
+
+    def _check_inputs_changed(self, *_):
+        if self.working_input_dict != self._saved_snapshot:
+            self.is_modified = True
+
+    def _mark_clean(self):
+        self.is_modified = False
+        self._saved_snapshot = deepcopy(self.working_input_dict)
+
+    def _confirm_discard_changes(self) -> bool:  # utility: True if the dialog may close (no changes, or user chose Discard)
+        if not self.is_modified:
+            return True
+        choice = CustomMessageBox(
+            title="Unsaved Changes",
+            text=MSG_UNSAVED_CHANGES,
+            buttons=[BTN_DISCARD, BTN_CANCEL],
+            dialogType=MessageBoxType.Warning,
+        ).exec()
+        if choice != BTN_DISCARD:
+            return False
+        # Edits are dropped: the next open reloads widgets from the committed input dict.
+        self.is_modified = False
+        return True
+
+    # ── Pre-Save Validation ──────────────────────────────────────────────────────
+
+    def _is_field_active(self, widget: QWidget) -> bool:  # utility: True if the user can currently see and edit this widget
+        """Enabled and not hidden inside its own tab page. Pages of a QTabWidget are
+        hidden simply because another tab is in front, so those are skipped; other
+        hidden ancestors (e.g. the inactive page of an AdaptiveWidget) mean inactive.
+        Tabs that are disabled or hidden do not count as active."""
+        if not widget.isEnabled():
+            return False
+        node = widget
+        while node is not None and node is not self:
+            parent = node.parentWidget()
+            tab_widget = parent.parentWidget() if isinstance(parent, QStackedWidget) else None
+            if isinstance(tab_widget, QTabWidget):
+                idx = tab_widget.indexOf(node)
+                if idx >= 0 and not (tab_widget.isTabEnabled(idx) and tab_widget.isTabVisible(idx)):
+                    return False
+            elif node.isHidden():
+                return False
+            node = parent
+        return True
+
+    def _find_empty_custom_fields(self) -> list:  # validation: [(parameter name, widget)] for Custom inputs left empty
+        """Walks every tab schema and collects inputs that are switched to Custom
+        but have no value. Three schema patterns carry a Custom choice:
+          * TYPE_MODE_LINE  - '<key>.mode' combo + '<key>.value' line edit
+          * TYPE_ADAPTIVE   - line edit shown when its controller key is Custom
+          * TYPE_COMBOBOX   - a Custom type that unlocks the text boxes of its card
+        """
+        missing, seen = [], set()
+
+        def _add(tab_label, field_def, line_edit):
+            if line_edit is None or id(line_edit) in seen:
+                return
+            if not self._is_field_active(line_edit) or line_edit.text().strip():
+                return
+            seen.add(id(line_edit))
+            label = _clean_label(field_def.get("label")) or field_def.get("id", "")
+            name = f"{tab_label} - {label}" if tab_label else label
+            missing.append((name, line_edit))
+
+        for tab_def in ADDITIONAL_INPUTS_SCHEMA:
+            for tab_label, fields in _iter_schema_sections(tab_def):
+                section_is_custom = False
+                for f in fields:
+                    ftype, key = f.get("type"), f.get("id", "")
+                    if not key:
+                        continue
+                    if ftype == TYPE_MODE_LINE:
+                        mode = self.findChild(QComboBox, key + ".mode")
+                        if mode and mode.currentText() == VALUE_CUSTOM:
+                            _add(tab_label, f, self.findChild(QLineEdit, key + ".value"))
+                    elif ftype == TYPE_ADAPTIVE:
+                        ctrl = f.get("controller", "")
+                        adaptive = self.findChild(AdaptiveWidget, key)
+                        if (adaptive and str(self.working_input_dict.get(ctrl) or "") == VALUE_CUSTOM
+                                and isinstance(adaptive.currentWidget(), QLineEdit)
+                                and self._is_field_active(adaptive)):
+                            _add(tab_label, f, adaptive.currentWidget())
+                    elif ftype == TYPE_COMBOBOX and VALUE_CUSTOM in (f.get("choices") or []):
+                        combo = self.findChild(QComboBox, key)
+                        if combo and combo.currentText() == VALUE_CUSTOM and self._is_field_active(combo):
+                            section_is_custom = True
+
+                if section_is_custom:
+                    for f in fields:
+                        if f.get("type") == TYPE_TEXTBOX and f.get("id"):
+                            _add(tab_label, f, self.findChild(QLineEdit, f["id"]))
+        return missing
+
+    def _focus_field(self, widget: QWidget):  # utility: brings the tab (and sub-tabs) holding widget to front and focuses it
+        node = widget
+        while node is not None and node is not self:
+            parent = node.parentWidget()
+            tab_widget = parent.parentWidget() if isinstance(parent, QStackedWidget) else None
+            if isinstance(tab_widget, QTabWidget) and tab_widget.indexOf(node) >= 0:
+                tab_widget.setCurrentWidget(node)
+            node = parent
+        widget.setFocus()
+
     # ── Dialog Persistence ───────────────────────────────────────────────────────
 
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
+
+        # Halt the save if any input set to Custom was left empty
+        missing = self._find_empty_custom_fields()
+        if missing:
+            CustomMessageBox(
+                title="Input Error",
+                text="\n".join(MSG_EMPTY_CUSTOM_FIELD.format(name) for name, _ in missing),
+                buttons=["OK"],
+                dialogType=MessageBoxType.Critical,
+            ).exec()
+            self._focus_field(missing[0][1])
+            return
 
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
@@ -521,7 +731,9 @@ class AdditionalInputs(QDialog):
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
             self.update_template_page_2d_cad.emit(cad.params)
-        
+
+        self._mark_clean()
+
         CustomMessageBox(
             title="Saved",
             text="Inputs saved successfully.",
