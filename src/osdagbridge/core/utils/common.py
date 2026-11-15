@@ -1409,6 +1409,9 @@ VALUES_GIRDER_SUPPORT_TYPE = [
     "Minor Laterally Unsupported",
     "Major Laterally Unsupported",
 ]
+# Option text that switches a field to user-defined input (shared by every "Custom" mode)
+VALUE_CUSTOM = "Custom"
+
 VALUES_GIRDER_DESIGN_MODE = ["Optimized", "Custom"]
 VALUES_GIRDER_SPAN_MODE = ["Full Length", "Custom"]
 VALUES_PROFILE_SCOPE = ["All", "Custom"]
