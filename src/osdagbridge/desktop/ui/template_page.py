@@ -350,6 +350,7 @@ class CustomWindow(QWidget):
         self.cad_comp_widget.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Expanding
         )
+        self.cad_comp_widget.cad_value_edited.connect(self._on_cad_value_edited)
         self.cad_log_splitter.addWidget(self.cad_comp_widget)
 
         # from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
@@ -900,6 +901,55 @@ class CustomWindow(QWidget):
                 pass
 
         # Apply state to CAD UI & Update Cad-State
+        self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+
+    def _on_cad_value_edited(self, key: str, value: float):
+        """
+        A dimension label was edited by double-click on the 2D CAD.
+        Validate it, write it (and its derived values) to the input dictionary,
+        mirror it in the Basic Inputs dock and redraw the CAD.
+        """
+        from osdagbridge.core.bridge_types.plate_girder.cad_edit import (
+            apply_cad_edit, CadEditError, CAD_EDITABLE_BASIC_KEYS,
+        )
+
+        if not self.input_dock:
+            return
+        if self.input_dock.is_locked:
+            CustomMessageBox(
+                title="Inputs Locked",
+                text="Inputs are locked after design. Unlock them to edit values on the CAD.",
+                dialogType=MessageBoxType.Warning,
+            ).exec()
+            return
+
+        # Settle pending Basic Inputs edits first so derived values are current
+        if self.input_dock.is_require_field_changed:
+            try:
+                solve_extend_basic_input_dict(self.input_dict)
+                self.input_dock.is_require_field_changed = False
+            except Exception:
+                pass
+
+        try:
+            apply_cad_edit(self.input_dict, key, value, self.input_dock.validator)
+        except CadEditError as exc:
+            CustomMessageBox(
+                title="Invalid Value",
+                text=str(exc),
+                dialogType=MessageBoxType.Warning,
+            ).exec()
+            return
+
+        # Basic inputs are also shown in the dock; additional inputs are reloaded
+        # from input_dict every time the Additional Inputs dialog opens.
+        if key in CAD_EDITABLE_BASIC_KEYS:
+            field = self.input_dock.findChild(QLineEdit, key)
+            if field is not None:
+                field.blockSignals(True)
+                field.setText(f"{float(self.input_dict[key]):g}")
+                field.blockSignals(False)
+
         self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
 
     #---------------------------------Docking-Icons-Functionality-START----------------------------------------------
