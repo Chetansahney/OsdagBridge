@@ -5,7 +5,7 @@ Author: Arushi
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QSplitter, QScrollArea, QHBoxLayout, QPushButton, QLabel
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal
 from .cad_cross_section import CrossSectionCADWidget
 from .cad_top_view import TopViewCADWidget
 from osdagbridge.core.utils.common import *
@@ -17,7 +17,10 @@ from osdagbridge.desktop.cad.irc5_geometry import (
 
 class BridgeDualCADWidget(QWidget):
     """Split view widget showing both cross-section and top view with individual controls"""
-    
+
+    # (input key, new value) from a double-click edit on either view's dimension labels
+    cad_value_edited = Signal(str, float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cross_zoom_level = 1.0
@@ -74,8 +77,13 @@ class BridgeDualCADWidget(QWidget):
         # Set equal sizes for both views
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 1)
-        
+
         layout.addWidget(self.splitter)
+
+        # Labels of the main template page CAD are editable by double-click
+        for view in (self.cross_section_widget, self.top_view_widget):
+            view.label_editing_enabled = True
+            view.label_value_edited.connect(self.cad_value_edited)
     
     def set_cross_section_visible(self, visible):
         self.cross_visible = visible
