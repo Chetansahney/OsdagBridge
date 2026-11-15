@@ -3914,6 +3914,20 @@ class PlateGirderBridge:
         """Return the deck overhang distance (0.0 when no overhang)."""
         return self.output_dict.get(KEY_TS_DECK_OVERHANG) or 0.0
 
+    def get_transverse_member_lines(self) -> list:
+        """Transverse member lines (end diaphragms + intermediate) between the outer girders.
+
+        Built from the ospgrillage member groups in results_data, see
+        results_data.build_transverse_member_lines for the structure.
+        """
+        if self.grillage_model.model is None:
+            return []
+        from .results_data import build_transverse_member_lines
+        nodes, members = self.get_nodes_members()
+        return build_transverse_member_lines(
+            self.grillage_model.model, nodes, members, edge_dist=self.get_edge_dist()
+        )
+
     def build_figure_sfd(self, ds, force_key: str):
         """Build and return a matplotlib Figure for the SFD of the given dataset slice."""
         nodes, members = self.get_nodes_members()

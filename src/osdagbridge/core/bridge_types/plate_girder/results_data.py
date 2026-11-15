@@ -94,6 +94,201 @@ def _build_nodes_members() -> tuple[dict, dict]:
     return nodes, members
 
 
+# =============================================================================
+# MEMBER CLASSIFICATION — longitudinal vs transverse element tags
+# =============================================================================
+# ospgrillage member groups (set via model.set_member in analyser.py)
+LONGITUDINAL_GROUPS = (
+    "edge_beam", "exterior_main_beam_1", "exterior_main_beam_2", "interior_main_beam",
+)
+END_DIAPHRAGM_GROUPS = ("start_edge", "end_edge")      # transverse lines at the supports
+INTERMEDIATE_TRANSVERSE_GROUPS = ("transverse_slab",)  # deck slab + intermediate cross bracing
+STANDARD_GROUPS = (
+    LONGITUDINAL_GROUPS + END_DIAPHRAGM_GROUPS + INTERMEDIATE_TRANSVERSE_GROUPS + ("shell_slab",)
+)
+
+# Member-local components of a transverse member, read from the GLOBAL element
+# forces ospgrillage returns (get_results default local_forces=False).
+# Girders run along global X, so for them local == global. Transverse members
+# run along global Z: local x = +Z (axial), local y = +Y (vertical), and
+# local z = x × y = -X. UI key -> (global component, sign).
+TRANSVERSE_FORCE_COMPONENTS = {
+    "Fx": ("Vz", 1.0),    # axial force
+    "Fy": ("Vy", 1.0),    # vertical shear
+    "Fz": ("Vx", -1.0),   # horizontal (in-plane) shear
+    "Mx": ("Mz", 1.0),    # torsion
+    "My": ("My", 1.0),    # bending about the vertical axis
+    "Mz": ("Mx", -1.0),   # bending from vertical loads (major axis)
+}
+_DISP_COMPONENTS = {"Dx": "x", "Dy": "y", "Dz": "z"}
+
+_Z_TOL = 1e-3
+
+
+def get_member_groups(model) -> dict:
+    """Element tags of every standard ospgrillage member group (missing group -> [])."""
+    groups = {}
+    for group_name in STANDARD_GROUPS:
+        try:
+            groups[group_name] = [int(e) for e in model.get_element(
+                member=group_name, options="elements")]
+        except Exception:
+            groups[group_name] = []
+    return groups
+
+
+def classify_member_tags(groups: dict, nodes: dict, members: dict) -> dict:
+    """Split element tags into longitudinal and transverse members.
+
+    Transverse tags come from the ospgrillage groups (end diaphragm lines
+    ``start_edge`` / ``end_edge`` and intermediate ``transverse_slab``); every
+    other frame element is longitudinal. The longitudinal groups are not used
+    for this because ospgrillage reports only one grid line per group.
+    If the model has no transverse groups, falls back to geometry: a member is
+    longitudinal when both end nodes share the same Y and Z.
+
+    Returns {"longitudinal", "transverse", "end_diaphragm", "intermediate_transverse"}
+    as sorted lists of int tags.
+    """
+    end_diaphragm = {t for g in END_DIAPHRAGM_GROUPS for t in groups.get(g, []) if t in members}
+    intermediate = {t for g in INTERMEDIATE_TRANSVERSE_GROUPS for t in groups.get(g, []) if t in members}
+    transverse = end_diaphragm | intermediate
+    shells = set(groups.get("shell_slab", []))
+
+    if not transverse:
+        for tag, (n1, n2) in members.items():
+            if n1 not in nodes or n2 not in nodes:
+                continue
+            same_line = (abs(nodes[n1][2] - nodes[n2][2]) < _Z_TOL and
+                         abs(nodes[n1][1] - nodes[n2][1]) < _Z_TOL)
+            if not same_line:
+                transverse.add(tag)
+        intermediate = set(transverse)
+
+    longitudinal = [
+        t for t, conn in members.items()
+        if t not in transverse and t not in shells and len(conn) == 2
+    ]
+    return {
+        "longitudinal": sorted(longitudinal),
+        "transverse": sorted(transverse),
+        "end_diaphragm": sorted(end_diaphragm),
+        "intermediate_transverse": sorted(intermediate),
+    }
+
+
+def build_transverse_member_lines(model, nodes: dict, members: dict, edge_dist: float = 0.0) -> list:
+    """Group transverse elements into lines across the bridge, between the outer girders.
+
+    Each transverse grid line (end diaphragm or intermediate) is a connected
+    chain of transverse elements. Elements of the deck overhang (outside the
+    outermost girders, i.e. connected to the edge beams when edge_dist > 0) are
+    dropped: they are slab cantilevers, not diaphragms or cross bracings.
+
+    Returns a list sorted by span position::
+
+        [{"name": "ED1", "kind": "end_diaphragm" | "intermediate",
+          "x": station, "elements": [tags ordered by z], "nodes": [node tags ordered by z]}, ...]
+    """
+    tags = classify_member_tags(get_member_groups(model), nodes, members)
+    if not tags["transverse"]:
+        return []
+
+    # Girder grid lines (z) from the longitudinal members; edge beams are the outermost lines
+    line_z = sorted({round(nodes[n][2], 3) for t in tags["longitudinal"] for n in members[t]})
+    girder_z = line_z[1:-1] if edge_dist > 0 and len(line_z) > 2 else line_z
+    if len(girder_z) < 2:
+        return []
+    z_lo, z_hi = girder_z[0] - _Z_TOL, girder_z[-1] + _Z_TOL
+
+    def _between_girders(tag):
+        return all(z_lo <= nodes[n][2] <= z_hi for n in members[tag])
+
+    # Connected components of transverse elements = one line each (lines only
+    # meet longitudinal members, never each other)
+    node_to_elems: dict = {}
+    for t in tags["transverse"]:
+        for n in members[t]:
+            node_to_elems.setdefault(n, []).append(t)
+
+    end_set = set(tags["end_diaphragm"])
+    seen, lines = set(), []
+    for start in tags["transverse"]:
+        if start in seen:
+            continue
+        stack, comp = [start], []
+        while stack:
+            t = stack.pop()
+            if t in seen:
+                continue
+            seen.add(t)
+            comp.append(t)
+            for n in members[t]:
+                stack.extend(node_to_elems.get(n, []))
+
+        elems = sorted(
+            (t for t in comp if _between_girders(t)),
+            key=lambda t: min(nodes[n][2] for n in members[t]),
+        )
+        if not elems:
+            continue
+        line_nodes = []
+        for t in elems:
+            n_lo, n_hi = sorted(members[t], key=lambda n: nodes[n][2])
+            if not line_nodes:
+                line_nodes.append(n_lo)
+            line_nodes.append(n_hi)
+        lines.append({
+            "kind": "end_diaphragm" if any(t in end_set for t in elems) else "intermediate",
+            "x": sum(nodes[n][0] for n in line_nodes) / len(line_nodes),
+            "elements": elems,
+            "nodes": line_nodes,
+        })
+
+    lines.sort(key=lambda ln: ln["x"])
+    n_ed, n_t = 0, 0
+    for ln in lines:
+        if ln["kind"] == "end_diaphragm":
+            n_ed += 1
+            ln["name"] = f"ED{n_ed}"
+        else:
+            n_t += 1
+            ln["name"] = f"T{n_t}"
+    return lines
+
+
+def transverse_line_forces(ds, line: dict, members: dict, force_key: str) -> list:
+    """Member-local internal force along a transverse line, one value per node (kN / kNm).
+
+    ``ds`` is a single-load-case slice. Uses the same convention as the girder
+    diagrams: the end force at each element's start node, and the negated end
+    force at the last node. Start/end follow the line direction (+Z), not the
+    element's i/j order, so element orientation does not affect the sign.
+    """
+    comp, sign = TRANSVERSE_FORCE_COMPONENTS[force_key]
+    forces = ds["forces"]
+
+    def _end_force(tag, node):
+        end = "i" if members[tag][0] == node else "j"
+        return float(forces.sel(Element=tag, Component=f"{comp}_{end}").values) / 1000.0
+
+    line_nodes, elems = line["nodes"], line["elements"]
+    values = [sign * _end_force(t, line_nodes[k]) for k, t in enumerate(elems)]
+    values.append(-sign * _end_force(elems[-1], line_nodes[-1]))
+    return values
+
+
+def transverse_line_displacements(ds, line: dict, disp_key: str) -> list:
+    """Nodal displacement along a transverse line in mm (same sign flip as the girder plot)."""
+    comp = _DISP_COMPONENTS[disp_key]
+    disp = ds["displacements"]
+    flip = -1.0 if comp in ("y", "z") else 1.0
+    return [
+        flip * float(disp.sel(Node=n, Component=comp).values) * 1000.0
+        for n in line["nodes"]
+    ]
+
+
 def dump_full_data(
     model,
     edge_dist: float = 0.0,
@@ -387,19 +582,7 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     nodes, members = _build_nodes_members()
 
     # Extract standard member groups via ospgrillage get_element API
-    standard_groups = [
-        "edge_beam", "exterior_main_beam_1", "exterior_main_beam_2",
-        "interior_main_beam", "start_edge", "end_edge", "transverse_slab",
-        "shell_slab"
-    ]
-    groups = {}
-    for group_name in standard_groups:
-        try:
-            # get_element returns list of tags
-            groups[group_name] = [int(e) for e in model.get_element(
-                member=group_name, options="elements")]
-        except Exception:
-            groups[group_name] = []
+    groups = get_member_groups(model)
 
     # Coordinate components
     ds0 = ds_all.isel(Loadcase=0)
@@ -408,18 +591,10 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     disp_components = [str(
         c) for c in ds0["displacements"].coords["Component"].values] if "displacements" in ds0.data_vars else []
 
-    # Classify members: longitudinal = both nodes share same Z and same Y
-    _z_tol = 1e-3
-    longitudinal_members = []
-    transverse_members = []
-    for tag, (n1, n2) in members.items():
-        if n1 not in nodes or n2 not in nodes:
-            continue
-        if (abs(nodes[n1][2] - nodes[n2][2]) < _z_tol and
-                abs(nodes[n1][1] - nodes[n2][1]) < _z_tol):
-            longitudinal_members.append(tag)
-        else:
-            transverse_members.append(tag)
+    # Classify members by ospgrillage group tags (geometric fallback inside)
+    member_tags = classify_member_tags(groups, nodes, members)
+    longitudinal_members = member_tags["longitudinal"]
+    transverse_members = member_tags["transverse"]
 
     data: dict = {
         "nodes": {str(k): list(v) for k, v in nodes.items()},
