@@ -1552,6 +1552,184 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     return fig, summary_data
 
 
+# =============================================================================
+# TRANSVERSE MEMBERS PLOT (end diaphragms + intermediate cross bracings)
+# =============================================================================
+
+# Plain-text names of the member-local quantities (see results_data.TRANSVERSE_FORCE_COMPONENTS)
+TRANSVERSE_QUANTITY = {
+    "Fx": "Axial Force", "Fy": "Vertical Shear", "Fz": "Horizontal Shear",
+    "Mx": "Torsion", "My": "Bending about Vertical Axis", "Mz": "Bending Moment",
+    "Dx": "Displacement", "Dy": "Deflection", "Dz": "Displacement",
+}
+TRANSVERSE_GROUP_LABELS = {"end_diaphragm": "End Diaphragms", "intermediate": "Intermediate Cross Bracings"}
+# Transverse diagrams lie across the width: an oblique view shows them (the girder
+# default view looks along the width and would show every line edge-on)
+TRANSVERSE_ELEV = 22
+TRANSVERSE_AZIM = -55
+
+
+def build_figure_transverse(ds, key, nodes, members, lines, edge_dist=0.0, eng_scale=1.0):
+    """
+    3-D diagram of internal forces / displacements along every transverse member line.
+
+    Parameters
+    ----------
+    ds      : xarray.Dataset slice for one load case
+    key     : a FORCE_MAP key (Fx … Mz, member-local axes) or DISP_MAP key (Dx, Dy, Dz)
+    lines   : results_data.build_transverse_member_lines(...) output
+
+    Each line is drawn across the bridge width at its span position: forces as
+    steps (constant along an element) for F keys, linear for moments and
+    displacements. End diaphragms are drawn heavier than intermediate lines.
+
+    Returns
+    -------
+    fig          : matplotlib.figure.Figure
+    summary_data : {"End Diaphragms": {"max", "min"}, "Intermediate Cross Bracings": {...}}
+    """
+    from .results_data import transverse_line_forces, transverse_line_displacements
+
+    v_scale   = _value_plot_scale(eng_scale)
+    is_disp   = key in DISP_MAP
+    is_shear  = key.startswith("F")
+    is_moment = key.startswith("M")
+    symbol    = (DISP_DISPLAY if is_disp else FORCE_DISPLAY).get(key, key)
+    unit      = "mm" if is_disp else ("kNm" if is_moment else "kN")
+    sign      = -1.0 if is_moment else 1.0          # positive moment plots downward, as in the BMD
+    line_color = "#6A1B9A" if is_disp else ("#C62828" if is_moment else "#1565C0")
+    fill_color = "#CE93D8" if is_disp else ("#EF9A9A" if is_moment else "#90CAF9")
+
+    fig = Figure(figsize=(14, 6), dpi=110, facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", facecolor="white")
+
+    all_xs = [c[0] for c in nodes.values()]
+    all_zs = [c[2] for c in nodes.values()]
+    x_range = max(all_xs) - min(all_xs) or 1.0
+    z_range = max(all_zs) - min(all_zs) or 1.0
+    x_pad, z_pad = 0.05 * x_range, 0.05 * z_range
+    ax.set_xlim(min(all_xs) - x_pad, max(all_xs) + x_pad)
+    ax.set_ylim(min(all_zs) - z_pad, max(all_zs) + z_pad)
+
+    # Girders as reference, transverse lines are the diagram baselines
+    _add_grillage_background(
+        ax, nodes, members,
+        show_transverse=True,
+        include_edge_longitudinals=False,
+        include_end_transverse=True,
+        show_inner_nodes=False,
+    )
+
+    summary_data = {}
+    global_vmin = global_vmax = 0.0
+    extreme = {"max": None, "min": None}   # (value, x, z, plot_y)
+    _scatter_objs, _scatter_data = [], {}
+
+    for ln in lines:
+        vals = np.array(
+            transverse_line_displacements(ds, ln, key) if is_disp
+            else transverse_line_forces(ds, ln, members, key)
+        )
+        xs = np.array([nodes[n][0] for n in ln["nodes"]])
+        zs = np.array([nodes[n][2] for n in ln["nodes"]])
+        y_plot = sign * vals * v_scale
+        is_end = ln["kind"] == "end_diaphragm"
+        lw = 2.4 if is_end else 1.5
+
+        if is_shear:
+            # constant along each element: step through the start values
+            x_d = np.repeat(xs, 2)[1:-1]
+            z_d = np.repeat(zs, 2)[1:-1]
+            y_d = np.repeat(y_plot[:-1], 2)
+        else:
+            x_d, z_d, y_d = xs, zs, y_plot
+
+        ax.plot_surface(
+            np.vstack([x_d, x_d]), np.vstack([z_d, z_d]),
+            np.vstack([np.zeros_like(y_d), y_d]),
+            color=fill_color, alpha=0.30 if is_end else 0.18,
+            linewidth=0, antialiased=False, zorder=2,
+        )
+        ax.plot(x_d, z_d, y_d, color=line_color, linewidth=lw, zorder=4)
+
+        ax.text(xs[0], zs[0] - 0.04 * z_range, 0, ln["name"],
+                color="black", fontsize=9 if is_end else 7, ha="center", va="top",
+                zorder=90, gid="girder_labels")
+        for xi, zi, yi, vi in zip(xs, zs, y_plot, vals):
+            ax.text(xi, zi, yi, f" {vi:.2f}", color="#555555", fontsize=6, zorder=5, gid="all_vals")
+
+        sc = ax.scatter(xs, zs, y_plot, color=line_color, s=18 if is_end else 10,
+                        zorder=5, depthshade=False)
+        _scatter_objs.append(sc)
+        _scatter_data[id(sc)] = (ln["name"], ln["nodes"], zs, vals)
+
+        if y_plot.size:
+            global_vmin = min(global_vmin, float(np.min(y_plot)))
+            global_vmax = max(global_vmax, float(np.max(y_plot)))
+        group = TRANSVERSE_GROUP_LABELS[ln["kind"]]
+        s = summary_data.setdefault(group, {"max": float(vals.max()), "min": float(vals.min())})
+        s["max"], s["min"] = max(s["max"], float(vals.max())), min(s["min"], float(vals.min()))
+        for which, idx in (("max", int(np.argmax(vals))), ("min", int(np.argmin(vals)))):
+            cur = extreme[which]
+            better = cur is None or (vals[idx] > cur[0] if which == "max" else vals[idx] < cur[0])
+            if better:
+                extreme[which] = (float(vals[idx]), xs[idx], zs[idx], y_plot[idx], ln["name"])
+
+    # Overall max / min markers (toggled by the Max / Min checkboxes)
+    for which, color in (("max", "#FF4136"), ("min", "#0074D9")):
+        if extreme[which] is None:
+            continue
+        v, xi, zi, yi, name = extreme[which]
+        ax.plot([xi, xi], [zi, zi], [0, yi], color=color, linewidth=1.5, linestyle="--",
+                zorder=3, gid=f"{which}_line")
+        ax.text(xi, zi, yi, f" {name}: {v:.2f} {unit}", color="#333333", fontsize=8,
+                fontweight="bold", zorder=6, gid=f"{which}_line",
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.0))
+
+    if _MPLCURSORS and _scatter_objs:
+        cursor = mplcursors.cursor(_scatter_objs, hover=True)
+
+        @cursor.connect("add")
+        def _on_add(sel, _data=_scatter_data):
+            name, nids, zs_l, vals_l = _data[id(sel.artist)]
+            i = sel.index
+            sel.annotation.set_text(
+                f"{name}  Node {nids[i]}\nZ: {zs_l[i]:.2f} m\n{symbol}: {vals_l[i]:.3f} {unit}"
+            )
+            sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
+
+    _add_supports(ax, nodes, members, edge_dist=edge_dist, selected_girder="All")
+    _add_node_number_labels(ax, nodes)
+    _add_element_number_labels(ax, nodes, members)
+
+    ax.set_xlabel("Span Length (m)", fontsize=10, labelpad=8)
+    ax.set_ylabel("Bridge Width (m)", fontsize=10, labelpad=8)
+    ax.set_zlabel(f"{symbol} ({unit})", fontsize=10, labelpad=8)
+    _set_value_axis_tick_formatter(ax, v_scale, value_sign=sign, use_abs=is_moment)
+    zmin, zmax = min(0.0, global_vmin), max(0.0, global_vmax)
+    pad = max(1e-6, 0.05 * max(1e-9, zmax - zmin))
+    ax.set_zlim(zmin - pad, zmax + pad)
+    ax.set_box_aspect([x_range, z_range, (x_range * 0.30) * max(v_scale, 1e-6)])
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]))
+
+    # Forces are in member axes (see results_data.TRANSVERSE_FORCE_COMPONENTS)
+    ax.set_title(
+        f"Transverse Members  —  {TRANSVERSE_QUANTITY.get(key, key)} {symbol} ({unit})",
+        fontsize=12, fontweight="bold", pad=12,
+    )
+    fig._eng_scale = v_scale
+    ax.view_init(elev=TRANSVERSE_ELEV, azim=TRANSVERSE_AZIM)
+    for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+        pane.fill = False
+        pane.set_edgecolor("#555555")
+        pane.set_linewidth(1.5)
+        pane.set_alpha(1.0)
+    ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.5)
+    _add_coordinate_triad(ax, nodes, eng_scale=v_scale)
+    ax.set_axis_off()
+    return fig, summary_data
+
+
 def figure_to_bytes(fig, fmt="png", dpi=150):
     """Convenience helper — render a matplotlib figure to raw bytes."""
     buf = io.BytesIO()
